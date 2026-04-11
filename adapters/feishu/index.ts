@@ -10,8 +10,8 @@
 import * as Lark from '@larksuiteoapi/node-sdk'
 import * as path from 'node:path'
 import { WsBridge, type ServerMessage } from '../common/ws-bridge.js'
-import { MessageBuffer } from '../common/message-buffer.js'
 import { MessageDedup } from '../common/message-dedup.js'
+import { StreamingCard } from './streaming-card.js'
 import { enqueue } from '../common/chat-queue.js'
 import { loadConfig } from '../common/config.js'
 import {
@@ -44,15 +44,8 @@ const dedup = new MessageDedup()
 const sessionStore = new SessionStore()
 const httpClient = new AdapterHttpClient(config.serverUrl)
 
-// Track state per chat
-type ChatState = {
-  cardId?: string
-  sequence: number
-  replyMessageId?: string
-}
-const chatStates = new Map<string, ChatState>()
-const buffers = new Map<string, MessageBuffer>()
-const accumulatedText = new Map<string, string>()
+// One streaming card lifecycle per chatId (CardKit main + patch fallback).
+const streamingCards = new Map<string, StreamingCard>()
 const pendingProjectSelection = new Map<string, boolean>()
 const runtimeStates = new Map<string, ChatRuntimeState>()
 
@@ -70,26 +63,6 @@ type ChatRuntimeState = {
 
 // ---------- helpers ----------
 
-function getChatState(chatId: string): ChatState {
-  let state = chatStates.get(chatId)
-  if (!state) {
-    state = { sequence: 0 }
-    chatStates.set(chatId, state)
-  }
-  return state
-}
-
-function getBuffer(chatId: string): MessageBuffer {
-  let buf = buffers.get(chatId)
-  if (!buf) {
-    buf = new MessageBuffer(async (text, isComplete) => {
-      await flushToFeishu(chatId, text, isComplete)
-    })
-    buffers.set(chatId, buf)
-  }
-  return buf
-}
-
 function getRuntimeState(chatId: string): ChatRuntimeState {
   let state = runtimeStates.get(chatId)
   if (!state) {
@@ -99,10 +72,39 @@ function getRuntimeState(chatId: string): ChatRuntimeState {
   return state
 }
 
+/** Get the existing StreamingCard for this chat, or create one in 'idle' state. */
+function getOrCreateStreamingCard(chatId: string): StreamingCard {
+  let card = streamingCards.get(chatId)
+  if (!card) {
+    card = new StreamingCard({ larkClient, chatId })
+    streamingCards.set(chatId, card)
+  }
+  return card
+}
+
+/** Finalize and remove the streaming card (normal completion). */
+async function finalizeStreamingCard(chatId: string): Promise<void> {
+  const card = streamingCards.get(chatId)
+  if (!card) return
+  streamingCards.delete(chatId)
+  await card.finalize()
+}
+
+/** Abort and remove the streaming card (error path). Non-throwing. */
+async function abortStreamingCard(chatId: string, err: Error): Promise<void> {
+  const card = streamingCards.get(chatId)
+  if (!card) return
+  streamingCards.delete(chatId)
+  await card.abort(err).catch(() => {})
+}
+
 function clearTransientChatState(chatId: string): void {
-  chatStates.delete(chatId)
-  accumulatedText.delete(chatId)
-  buffers.get(chatId)?.reset()
+  // Abort any in-flight streaming card (best effort, don't block)
+  const card = streamingCards.get(chatId)
+  if (card) {
+    streamingCards.delete(chatId)
+    void card.abort(new Error('session cleared')).catch(() => {})
+  }
   const runtime = getRuntimeState(chatId)
   runtime.state = 'idle'
   runtime.verb = undefined
@@ -218,43 +220,6 @@ async function sendCard(chatId: string, card: Record<string, unknown>): Promise<
   } catch (err) {
     console.error('[Feishu] Send card error:', err)
     return undefined
-  }
-}
-
-/** Build a simple streaming text card (Schema 1.0, patchable via im.message.patch).
- *
- *  The `content` is run through `optimizeMarkdownForFeishu` first: Feishu's
- *  `tag:'markdown'` element has a known rendering bug where H1~H3 headings
- *  (`#`, `##`, `###`) show up as literal text instead of being styled.
- *  openclaw-lark works around this in `src/card/markdown-style.ts` by
- *  downgrading H1→H4 and H2~H6→H5. We do the same here. */
-function buildStreamingCard(text: string): Record<string, unknown> {
-  const content = optimizeMarkdownForFeishu(text || ' ')
-  return {
-    config: {
-      wide_screen_mode: true,
-      update_multi: true,
-    },
-    elements: [
-      { tag: 'markdown', content },
-    ],
-  }
-}
-
-/** Update a streaming card message's content (patch).
- *  Note: im.message.patch only works on interactive cards, so the source
- *  message MUST have been sent via sendCard(buildStreamingCard(...)). */
-async function patchMessage(messageId: string, text: string): Promise<void> {
-  try {
-    await larkClient.im.message.patch({
-      path: { message_id: messageId },
-      data: {
-        content: JSON.stringify(buildStreamingCard(text)),
-      },
-    })
-  } catch (err) {
-    // patch may fail (rate limit, message expired, etc.) — log and ignore
-    console.error('[Feishu] patchMessage error:', err instanceof Error ? err.message : err)
   }
 }
 
@@ -582,36 +547,6 @@ function buildPermissionCard(
   }
 }
 
-async function flushToFeishu(chatId: string, newText: string, isComplete: boolean): Promise<void> {
-  const prev = accumulatedText.get(chatId) ?? ''
-  const fullText = prev + newText
-  accumulatedText.set(chatId, fullText)
-
-  const state = getChatState(chatId)
-
-  if (state.replyMessageId) {
-    const displayText = fullText + (isComplete ? '' : ' ▍')
-    await patchMessage(state.replyMessageId, displayText)
-  }
-
-  if (isComplete) {
-    if (!state.replyMessageId && fullText.trim()) {
-      // Fallback path: no streaming card was created for this text block
-      // (e.g. sendCard failed, or upstream never fired content_start{text}).
-      // Must go through sendCard(buildStreamingCard), NOT sendText — the
-      // latter uses msg_type=post + tag:'md' which is INLINE-ONLY and won't
-      // render block-level markdown (#, ```fenced```, tables, lists).
-      const chunks = splitMessage(fullText, 30000)
-      for (const chunk of chunks) {
-        await sendCard(chatId, buildStreamingCard(chunk))
-      }
-    }
-    accumulatedText.delete(chatId)
-    chatStates.delete(chatId)
-    buffers.get(chatId)?.reset()
-  }
-}
-
 // ---------- session management ----------
 
 async function ensureSession(chatId: string): Promise<boolean> {
@@ -635,6 +570,18 @@ async function ensureSession(chatId: string): Promise<boolean> {
 
 async function createSessionForChat(chatId: string, workDir: string): Promise<boolean> {
   try {
+    // Always tear down any stale WS connection before creating a new session.
+    // Without this, bridge.connectSession() below would short-circuit when an
+    // old OPEN connection still exists (e.g. /projects → pick_project path),
+    // leaving user messages routed to the previous session's workDir.
+    bridge.resetSession(chatId)
+    // Also abort any in-flight streaming card tied to the old session.
+    const inflightCard = streamingCards.get(chatId)
+    if (inflightCard) {
+      streamingCards.delete(chatId)
+      void inflightCard.abort(new Error('session reset')).catch(() => {})
+    }
+
     const sessionId = await httpClient.createSession(workDir)
     sessionStore.set(chatId, sessionId, workDir)
     bridge.connectSession(chatId, sessionId)
@@ -676,10 +623,12 @@ async function showProjectPicker(chatId: string): Promise<void> {
 async function startNewSession(chatId: string, query?: string): Promise<void> {
   bridge.resetSession(chatId)
   sessionStore.delete(chatId)
-  chatStates.delete(chatId)
-  accumulatedText.delete(chatId)
-  buffers.get(chatId)?.reset()
-  buffers.delete(chatId)
+  // Abort any in-flight streaming card for the previous session
+  const inflightCard = streamingCards.get(chatId)
+  if (inflightCard) {
+    streamingCards.delete(chatId)
+    void inflightCard.abort(new Error('session reset')).catch(() => {})
+  }
   pendingProjectSelection.delete(chatId)
   runtimeStates.delete(chatId)
 
@@ -719,62 +668,52 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
 // ---------- server message handler ----------
 
 async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<void> {
-  const buf = getBuffer(chatId)
-  const state = getChatState(chatId)
   const runtime = getRuntimeState(chatId)
 
   switch (msg.type) {
     case 'connected':
       break
 
-    case 'status':
+    case 'status': {
       runtime.state = msg.state
       runtime.verb = typeof msg.verb === 'string' ? msg.verb : undefined
-      if (msg.state === 'thinking' && !state.replyMessageId) {
-        const mid = await sendCard(chatId, buildStreamingCard('💭 思考中...'))
-        if (mid) {
-          state.replyMessageId = mid
-          accumulatedText.set(chatId, '')
-        }
-      }
+      // 注意: 故意不在 thinking 时创建卡片。/clear、/compact 这类命令
+      // 不产生文本输出，但 CLI 仍会发 thinking → message_complete 事件。
+      // 如果在 thinking 就建卡，这些命令会留下一张空卡片。
+      // 真正的创建时机是 content_start{text} 或第一次 content_delta。
       break
+    }
 
-    case 'content_start':
+    case 'content_start': {
       if (msg.blockType === 'text') {
-        if (!state.replyMessageId) {
-          const mid = await sendCard(chatId, buildStreamingCard('▍'))
-          if (mid) {
-            state.replyMessageId = mid
-            accumulatedText.set(chatId, '')
-          }
-        }
-      } else if (msg.blockType === 'tool_use') {
-        // Finalize current text before tool calls,
-        // so text after tools gets a fresh message
-        await buf.complete()
-        // If reply still exists (buffer was already empty), clean up directly
-        if (state.replyMessageId) {
-          const text = accumulatedText.get(chatId)
-          if (text?.trim()) {
-            await patchMessage(state.replyMessageId, text)
-          }
-          accumulatedText.delete(chatId)
-          chatStates.delete(chatId)
-          buffers.get(chatId)?.reset()
-        }
+        // 幂等: 预建卡或上一次 content_delta 已经创建了卡片则复用，否则现在创建
+        const card = getOrCreateStreamingCard(chatId)
+        await card.ensureCreated().catch((err) => {
+          console.error('[Feishu] ensureCreated on content_start failed:', err)
+        })
       }
+      // 注意: tool_use 不 finalize 当前卡。让整个 turn 的所有文本输出
+      // 合并到同一张卡里 —— 更接近 Desktop UI 的一体化答复体验，也避免
+      // "预建空卡 + tool_use finalize → 留下空白卡" 的视觉 bug。
       break
+    }
 
-    case 'content_delta':
-      if (msg.text) {
-        buf.append(msg.text)
+    case 'content_delta': {
+      if (typeof msg.text === 'string' && msg.text) {
+        // 正常情况 content_start{text} 已经创建了卡片，这里直接 appendText。
+        // 极端情况（上游跳过了 content_start）也要能容错 —— getOrCreate + async ensureCreated。
+        const card = getOrCreateStreamingCard(chatId)
+        // ensureCreated 幂等，已 streaming 时是 no-op
+        void card.ensureCreated().catch((err) => {
+          console.error('[Feishu] ensureCreated on delta failed:', err)
+        })
+        card.appendText(msg.text)
       }
       break
+    }
 
     case 'thinking':
-      if (state.replyMessageId) {
-        await patchMessage(state.replyMessageId, `💭 ${msg.text.slice(0, 500)}...`)
-      }
+      // 推理文本（reasoning），当前版本不单独渲染，等以后加 collapsible panel
       break
 
     case 'tool_use_complete':
@@ -783,7 +722,6 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
 
     case 'tool_result':
       // Tool errors are handled internally by the AI (retries etc.)
-      // No need to notify the user for every failed attempt.
       break
 
     case 'permission_request': {
@@ -803,23 +741,18 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'message_complete':
       runtime.state = 'idle'
       runtime.verb = undefined
-      await buf.complete()
-      // Ensure state is always cleaned up even if buffer was already empty
-      if (state.replyMessageId) {
-        const text = accumulatedText.get(chatId)
-        if (text?.trim()) {
-          await patchMessage(state.replyMessageId, text)
-        }
-        accumulatedText.delete(chatId)
-        chatStates.delete(chatId)
-        buffers.get(chatId)?.reset()
-      }
+      await finalizeStreamingCard(chatId)
       break
 
     case 'error':
       runtime.state = 'idle'
       runtime.verb = undefined
-      await sendText(chatId, `❌ ${msg.message}`)
+      // 如果 streaming card 存在就把错误渲染到卡上，否则 fallback 到 sendText
+      if (streamingCards.has(chatId)) {
+        await abortStreamingCard(chatId, new Error(msg.message ?? 'unknown error'))
+      } else {
+        await sendText(chatId, `❌ ${msg.message}`)
+      }
       break
 
     case 'system_notification':
@@ -917,61 +850,79 @@ async function handleMessage(data: any): Promise<void> {
   text = stripMentions(text)
   if (!text) return
 
-  // Handle commands
-  if (text === '/new' || text === '新会话' || text.startsWith('/new ')) {
-    const arg = text.startsWith('/new ') ? text.slice(5).trim() : ''
-    await startNewSession(chatId, arg || undefined)
-    return
-  }
-  if (text === '/help' || text === '帮助') {
-    await sendText(chatId, formatImHelp())
-    return
-  }
-  if (text === '/status' || text === '状态') {
-    await sendText(chatId, await buildStatusText(chatId))
-    return
-  }
-  if (text === '/clear' || text === '清空') {
-    const stored = await ensureExistingSession(chatId)
-    if (!stored) {
-      await sendText(chatId, formatImStatus(null))
-      return
-    }
-    clearTransientChatState(chatId)
-    const sent = bridge.sendUserMessage(chatId, '/clear')
-    if (!sent) {
-      await sendText(chatId, '⚠️ 无法发送 /clear，请先发送 /new 重新连接会话。')
-      return
-    }
-    await sendText(chatId, '🧹 已清空当前会话上下文。')
-    return
-  }
-  if (text === '/stop' || text === '停止') {
-    const stored = await ensureExistingSession(chatId)
-    if (!stored) {
-      await sendText(chatId, formatImStatus(null))
-      return
-    }
-    bridge.sendStopGeneration(chatId)
-    await sendText(chatId, '⏹ 已发送停止信号。')
-    return
-  }
-  if (text === '/projects' || text === '项目列表') {
-    await showProjectPicker(chatId)
-    return
-  }
+  const msgText = text  // capture in a const so TypeScript knows it's not null inside closures
 
-  // Check if user is responding to project selection
-  if (pendingProjectSelection.has(chatId)) {
-    await startNewSession(chatId, text.trim())
-    return
-  }
-
-  // Normal message flow
+  // All user input (commands + normal chat) goes through a single per-chat
+  // serial queue. Without this, rapidly-fired commands could have their
+  // async bodies interleave at `await` points, causing reply messages
+  // (e.g. "🧹 已清空..." after "✅ 已新建...") to appear in the wrong order.
   enqueue(chatId, async () => {
+    // ----- Commands -----
+
+    if (msgText === '/new' || msgText === '新会话' || msgText.startsWith('/new ')) {
+      const arg = msgText.startsWith('/new ') ? msgText.slice(5).trim() : ''
+      await startNewSession(chatId, arg || undefined)
+      return
+    }
+    if (msgText === '/help' || msgText === '帮助') {
+      await sendText(chatId, formatImHelp())
+      return
+    }
+    if (msgText === '/status' || msgText === '状态') {
+      await sendText(chatId, await buildStatusText(chatId))
+      return
+    }
+    if (msgText === '/clear' || msgText === '清空') {
+      const stored = await ensureExistingSession(chatId)
+      if (!stored) {
+        await sendText(chatId, formatImStatus(null))
+        return
+      }
+      clearTransientChatState(chatId)
+      const sent = bridge.sendUserMessage(chatId, '/clear')
+      if (!sent) {
+        await sendText(chatId, '⚠️ 无法发送 /clear，请先发送 /new 重新连接会话。')
+        return
+      }
+      await sendText(chatId, '🧹 已清空当前会话上下文。')
+      return
+    }
+    if (msgText === '/stop' || msgText === '停止') {
+      const stored = await ensureExistingSession(chatId)
+      if (!stored) {
+        await sendText(chatId, formatImStatus(null))
+        return
+      }
+      bridge.sendStopGeneration(chatId)
+      await sendText(chatId, '⏹ 已发送停止信号。')
+      return
+    }
+    if (msgText === '/projects' || msgText === '项目列表') {
+      await showProjectPicker(chatId)
+      return
+    }
+
+    // User is replying to a project picker prompt
+    if (pendingProjectSelection.has(chatId)) {
+      await startNewSession(chatId, msgText.trim())
+      return
+    }
+
+    // ----- Normal message flow -----
+
     const ready = await ensureSession(chatId)
     if (ready) {
-      const sent = bridge.sendUserMessage(chatId, text!)
+      // Pre-create the streaming card immediately so the user sees a
+      // "☁️ 正在思考中..." indicator while the backend is still thinking
+      // (before the first content_delta arrives). We intentionally do NOT
+      // create a card for /clear-style commands (which go through the
+      // earlier branches), so they won't leave an empty card behind.
+      const card = getOrCreateStreamingCard(chatId)
+      void card.ensureCreated().catch((err) => {
+        console.error('[Feishu] pre-create streaming card failed:', err)
+      })
+
+      const sent = bridge.sendUserMessage(chatId, msgText)
       if (!sent) {
         await sendText(chatId, '⚠️ 消息发送失败，连接可能已断开。请发送 /new 重新开始。')
       }
