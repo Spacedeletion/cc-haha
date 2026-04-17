@@ -142,11 +142,11 @@ function ProviderSettings() {
         className={`relative flex flex-col rounded-xl border transition-all mb-2 ${
           isOfficialActive
             ? 'border-[var(--color-brand)] bg-[var(--color-primary-fixed)]'
-            : 'border-[var(--color-border)] hover:border-[var(--color-border-focus)]'
+            : 'border-[var(--color-border)] hover:border-[var(--color-border-focus)] cursor-pointer'
         }`}
       >
         <div
-          className={`flex items-center gap-4 px-4 py-3.5 ${!isOfficialActive ? 'cursor-pointer' : ''}`}
+          className="flex items-center gap-4 px-4 py-3.5"
           onClick={() => !isOfficialActive && handleActivateOfficial()}
         >
           <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${isOfficialActive ? 'bg-[var(--color-success)]' : 'bg-[var(--color-text-tertiary)]'}`} />
@@ -162,7 +162,7 @@ function ProviderSettings() {
         </div>
 
         {isOfficialActive && (
-          <div className="px-4 pb-4 pt-2 border-t border-[var(--color-border-separator)]">
+          <div className="px-4 pb-4 pt-3 border-t border-[var(--color-border-separator)]">
             <ClaudeOfficialLogin />
           </div>
         )}
